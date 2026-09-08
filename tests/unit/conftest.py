@@ -34,7 +34,7 @@ def unit_name(unit_id, app_name):
 
 @pytest.fixture
 def ctx(tmp_path, unit_id, app_name):
-    src_dirs = ["grafana_dashboards", "loki_alert_rules", "prometheus_alert_rules", "logrotate.d"]
+    src_dirs = ["grafana_dashboards", "loki_alert_rules", "prometheus_alert_rules"]
     # Create a virtual charm_root so Scenario respects the `src_dirs`
     # Related to https://github.com/canonical/operator/issues/1673
     for src_dir in src_dirs:
@@ -43,7 +43,6 @@ def ctx(tmp_path, unit_id, app_name):
         copytree(source_path, target_path, dirs_exist_ok=True)
     with (
         patch("charm.refresh_certs", lambda: True),
-        patch("charm.ensure_logrotate_timer", lambda: True),
     ):
         yield Context(
             OpenTelemetryCollectorCharm, charm_root=tmp_path, unit_id=unit_id, app_name=app_name
@@ -110,8 +109,9 @@ def otelcol_version():
 
 @pytest.fixture(autouse=True)
 def mock_lock_dir(tmp_path):
-    with patch("singleton_snap.SingletonSnapManager.LOCK_DIR", tmp_path / "lock_dir"):
-        yield
+    lock_dir = tmp_path / "lock_dir"
+    with patch("singleton_snap.SingletonSnapManager.LOCK_DIR", lock_dir):
+        yield lock_dir
 
 
 @pytest.fixture(autouse=True)
@@ -119,20 +119,6 @@ def config_folder(tmp_path):
     config_file = tmp_path / "config.d"
     with patch("charm.CONFIG_FOLDER", config_file):
         yield config_file
-
-
-@pytest.fixture(autouse=True)
-def otelcol_log_file(tmp_path):
-    config_file = str(tmp_path / "otelcol.log")
-    with patch("config_builder.INTERNAL_TELEMETRY_LOG_FILE", config_file):
-        yield config_file
-
-
-@pytest.fixture(autouse=True)
-def logrotate_file(tmp_path):
-    """Mock the logrotate file path and ensure it exists."""
-    with patch("charm.LOGROTATE_PATH", tmp_path / "logrotate.d/otelcol") as logrotate_file:
-        yield logrotate_file
 
 
 @pytest.fixture
@@ -164,15 +150,22 @@ def mock_snap_operations():
     mock_snap.stop.return_value = None
     mock_snap.restart.return_value = None
 
-    # Mock the snap.Snap class to return our mock instance
-    with patch("charm.snap.Snap", return_value=mock_snap):
+    # Create a mock for SnapCache that returns the mock snap
+    mock_cache = MagicMock()
+    mock_cache.__getitem__ = MagicMock(return_value=mock_snap)
+
+    # Mock both snap.Snap and snap.SnapCache to return our mock instance
+    with (
+        patch("charm.snap.Snap", return_value=mock_snap),
+        patch("charm.snap.SnapCache", return_value=mock_cache),
+    ):
         yield
 
 
-@pytest.fixture(autouse=True)
-def mock_singleton_snap_manager():
-    """Mock SingletonSnapManager methods."""
-    with patch("singleton_snap.SingletonSnapManager.get_revisions", return_value={1, 2}):
+@pytest.fixture
+def mock_add_alerts():
+    """Suppress alert-rule injection during certificate-related tests."""
+    with patch("integrations._add_alerts"):
         yield
 
 
@@ -194,11 +187,14 @@ def mock_cos_agent_update_tracing():
 
 
 @pytest.fixture(autouse=True)
-def mock_ensure_certs_dir(request):
-    """Mock the _ensure_certs_dir method to avoid PermissionError in tests."""
+def mock_ensure_directory(request, tmp_path):
+    """Mock the _ensure_directory method to avoid PermissionError in tests."""
+    node_exporter_dir = tmp_path / "textfile-collector.d"
+    node_exporter_dir.mkdir(parents=True, exist_ok=True)
     with (
-        patch("charm.OpenTelemetryCollectorCharm._ensure_certs_dir"),
+        patch("charm.OpenTelemetryCollectorCharm._ensure_directory"),
         patch("charm.CERT_DIR", "/tmp/test_certs"),
+        patch("charm.NODE_EXPORTER_TEXTFILE_DIRECTORY", str(node_exporter_dir)),
     ):
         yield
 
@@ -267,7 +263,97 @@ def config_manager():
         insecure_skip_verify=True,
     )
 
+
 @pytest.fixture(autouse=True)
 def patch_hostname():
     with patch("socket.gethostname", return_value="juju-abcde-0"):
         yield
+
+
+@pytest.fixture
+def mock_socket_with_occupied_ports():
+    """Factory fixture to create a mock socket that simulates occupied ports.
+
+    Returns a function that takes a list of occupied ports and returns a configured mock.
+    """
+
+    def _create_mock(occupied_ports):
+        """Create a mock socket that raises OSError for occupied ports."""
+
+        def mock_bind(address):
+            if address[1] in occupied_ports:
+                raise OSError("[Errno 98] Address already in use")
+
+        mock_sock = MagicMock()
+        mock_sock.bind = MagicMock(side_effect=mock_bind)
+        mock_sock.__enter__ = MagicMock(return_value=mock_sock)
+        mock_sock.__exit__ = MagicMock(return_value=False)
+
+        return MagicMock(return_value=mock_sock)
+
+    return _create_mock
+
+
+@pytest.fixture
+def logql_alert_rule():
+    return {
+        "name": "otelcol_f4d59020_charm_x_foo_alerts",
+        "rules": [
+            {
+                "alert": "HighLogVolume",
+                "expr": 'count_over_time({job=~".+"}[30s]) > 100',
+                "labels": {"severity": "high"},
+            },
+        ],
+    }
+
+
+@pytest.fixture
+def logql_record_rule():
+    return {
+        "name": "otelcol_f4d59020_charm_x_foobar_alerts",
+        "rules": [
+            {
+                "record": "log:error_rate:rate5m",
+                "expr": 'sum by (service) (rate({job=~".+"} | json | level="error" [5m]))',
+                "labels": {"severity": "high"},
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def promql_alert_rule():
+    return {
+        "name": "otelcol_f4d59020_charm_x_bar_alerts",
+        "rules": [
+            {
+                "alert": "Workload Missing",
+                "expr": 'up{job=~".+"} == 0',
+                "for": "0m",
+                "labels": {"severity": "critical"},
+            },
+        ],
+    }
+
+
+@pytest.fixture
+def promql_record_rule():
+    return {
+        "name": "otelcol_f4d59020_charm_x_barfoo_alerts",
+        "rules": [
+            {
+                "record": "code:prometheus_http_requests_total:sum",
+                "expr": 'sum by (code) (prometheus_http_requests_total{job=~".+"})',
+                "labels": {"severity": "high"},
+            }
+        ],
+    }
+
+
+@pytest.fixture
+def all_rules(logql_alert_rule, logql_record_rule, promql_alert_rule, promql_record_rule):
+    return {
+        "logql": {"groups": [logql_alert_rule, logql_record_rule]},
+        "promql": {"groups": [promql_alert_rule, promql_record_rule]},
+    }

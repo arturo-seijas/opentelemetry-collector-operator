@@ -4,8 +4,12 @@
 """Feature: Opentelemetry-collector config builder."""
 
 import copy
+
 import pytest
-from config_manager import ConfigManager
+import yaml
+
+from src.config_manager import ConfigManager
+from charmlibs.interfaces.otlp import OtlpEndpoint
 
 
 def test_add_log_forwarding():
@@ -43,7 +47,7 @@ def test_add_traces_forwarding():
     # GIVEN an empty config
     config_manager = ConfigManager("otelcol/0", "0", "", "", insecure_skip_verify=True)
 
-    # WHEN a traces exporter is added to the config
+    # WHEN a single traces exporter is added to the config
     expected_traces_forwarding_cfg = {
         "endpoint": "http://192.168.1.244:4318",
         "retry_on_failure": {
@@ -53,13 +57,44 @@ def test_add_traces_forwarding():
     }
     config_manager.add_traces_forwarding(
         endpoint="http://192.168.1.244:4318",
+        identifier=0,
     )
-    # THEN it exists in the traces exporter config
+    # THEN it exists in the traces exporter config under a uniquely named key
     config = dict(
-        sorted(config_manager.config._config["exporters"]["otlphttp/send-traces"].items())
+        sorted(config_manager.config._config["exporters"]["otlphttp/rel-0/send-traces"].items())
     )
     expected_config = dict(sorted(expected_traces_forwarding_cfg.items()))
     assert config == expected_config
+
+
+def test_add_traces_forwarding_multiple_endpoints():
+    # GIVEN an empty config
+    config_manager = ConfigManager("otelcol/0", "0", "", "", insecure_skip_verify=True)
+
+    # WHEN two traces exporters are added to the config (one per Tempo backend)
+    config_manager.add_traces_forwarding(
+        endpoint="http://tempo1.example.com:4318",
+        identifier=0,
+    )
+    config_manager.add_traces_forwarding(
+        endpoint="http://tempo2.example.com:4318",
+        identifier=1,
+    )
+
+    exporters = config_manager.config._config["exporters"]
+
+    # THEN two distinct exporters exist
+    assert "otlphttp/rel-0/send-traces" in exporters
+    assert "otlphttp/rel-1/send-traces" in exporters
+    assert exporters["otlphttp/rel-0/send-traces"]["endpoint"] == "http://tempo1.example.com:4318"
+    assert exporters["otlphttp/rel-1/send-traces"]["endpoint"] == "http://tempo2.example.com:4318"
+
+    # AND both exporters are wired into the traces pipeline
+    pipeline_exporters = config_manager.config._config["service"]["pipelines"]["traces/otelcol/0"][
+        "exporters"
+    ]
+    assert "otlphttp/rel-0/send-traces" in pipeline_exporters
+    assert "otlphttp/rel-1/send-traces" in pipeline_exporters
 
 
 def test_add_remote_write():
@@ -69,9 +104,14 @@ def test_add_remote_write():
     # WHEN a remote write exporter is added to the config
     expected_remote_write_cfg = {
         "endpoint": "http://192.168.1.244/cos-prometheus-0/api/v1/write",
+        "add_metric_suffixes": False,
         "tls": {
             "insecure_skip_verify": True,
         },
+        "retry_on_failure": {
+            "max_elapsed_time": "5m",
+        },
+        "remote_write_queue": {"enabled": True, "queue_size": 1000},
     }
     config_manager.add_remote_write(
         endpoints=[{"url": "http://192.168.1.244/cos-prometheus-0/api/v1/write"}],
@@ -113,7 +153,7 @@ def test_add_prometheus_scrape():
                     "tls_config": {"insecure_skip_verify": True},
                 },
             ],
-        }
+        },
     }
     config_manager.add_prometheus_scrape_jobs(first_job)
     # THEN it exists in the prometheus receiver config
@@ -151,7 +191,11 @@ def test_add_prometheus_scrape():
         (
             {"logs": False, "metrics": False, "traces": False},
             {
-                "logs/otelcol/0": {"receivers": ["otlp/foo"], "exporters": []},
+                "logs/otelcol/0": {
+                    "receivers": ["otlp/foo"],
+                    "processors": ["filter/internal-telemetry-loop-breaker/otelcol/0"],
+                    "exporters": [],
+                },
                 "metrics/otelcol/0": {"receivers": ["otlp/foo"], "exporters": []},
                 "traces/otelcol/0": {"receivers": ["otlp/foo"], "exporters": []},
             },
@@ -161,6 +205,7 @@ def test_add_prometheus_scrape():
             {
                 "logs/otelcol/0": {
                     "receivers": ["otlp/foo"],
+                    "processors": ["filter/internal-telemetry-loop-breaker/otelcol/0"],
                     "exporters": ["debug/juju-config-enabled"],
                 },
                 "metrics/otelcol/0": {
@@ -178,6 +223,7 @@ def test_add_prometheus_scrape():
             {
                 "logs/otelcol/0": {
                     "receivers": ["otlp/foo"],
+                    "processors": ["filter/internal-telemetry-loop-breaker/otelcol/0"],
                     "exporters": ["debug/juju-config-enabled"],
                 },
                 "metrics/otelcol/0": {"receivers": ["otlp/foo"]},
@@ -214,3 +260,170 @@ def test_add_debug_exporters(enabled_pipelines, expected_pipelines):
     ]
     # AND the debug exporter is only attached to the enabled pipelines
     assert expected_pipelines == config_manager.config._config["service"]["pipelines"]
+
+
+def test_add_otlp_forwarding():
+    # GIVEN an empty config
+    config_manager = ConfigManager("otelcol/0", "otelcol", "", "", insecure_skip_verify=True)
+
+    # WHEN the OTLP providers for multiple relations have provided the preferred protocols
+    unit_name = "otelcol/0"
+    config_manager.add_otlp_forwarding(
+        relation_map={
+            0: OtlpEndpoint(
+                **{
+                    "protocol": "grpc",
+                    "endpoint": "1.2.3.4:grpc-port",
+                    "telemetries": ["metrics", "traces"],
+                    "insecure": False,
+                }
+            ),
+            1: OtlpEndpoint(
+                **{
+                    "protocol": "http",
+                    "endpoint": "http://host-1:http-port",
+                    "telemetries": ["logs"],
+                    "insecure": True,
+                }
+            ),
+            2: OtlpEndpoint(
+                **{
+                    "protocol": "grpc",
+                    "endpoint": "host-2:grpc-port",
+                    "telemetries": ["logs", "traces"],
+                    "insecure": True,
+                }
+            ),
+        }
+    )
+
+    # THEN the exporter config contains appropriate "otlp" and "otlphttp" exporters
+    expected_exporters = {
+        f"otlp/rel-0/{unit_name}": {
+            "endpoint": "1.2.3.4:grpc-port",
+            "tls": {"insecure": False, "insecure_skip_verify": True},
+            "retry_on_failure": {"max_elapsed_time": "5m"},
+            "sending_queue": {"enabled": True, "queue_size": 1000, "storage": "file_storage"},
+        },
+        f"otlphttp/rel-1/{unit_name}": {
+            "endpoint": "http://host-1:http-port",
+            "tls": {"insecure": True, "insecure_skip_verify": True},
+            "retry_on_failure": {"max_elapsed_time": "5m"},
+            "sending_queue": {"enabled": True, "queue_size": 1000, "storage": "file_storage"},
+        },
+        f"otlp/rel-2/{unit_name}": {
+            "endpoint": "host-2:grpc-port",
+            "tls": {"insecure": True, "insecure_skip_verify": True},
+            "retry_on_failure": {"max_elapsed_time": "5m"},
+            "sending_queue": {"enabled": True, "queue_size": 1000, "storage": "file_storage"},
+        },
+    }
+    # AND the exporters are added to the appropriate pipelines
+    expected_pipelines = {
+        "logs/otelcol/0": {
+            "receivers": ["otlp/otelcol"],
+            "processors": ["filter/internal-telemetry-loop-breaker/otelcol/0"],
+            "exporters": [f"otlphttp/rel-1/{unit_name}", f"otlp/rel-2/{unit_name}"],
+        },
+        "metrics/otelcol/0": {
+            "receivers": ["otlp/otelcol"],
+            "exporters": [f"otlp/rel-0/{unit_name}"],
+        },
+        "traces/otelcol/0": {
+            "receivers": ["otlp/otelcol"],
+            "exporters": [f"otlp/rel-0/{unit_name}", f"otlp/rel-2/{unit_name}"],
+        },
+    }
+    assert config_manager.config._config["exporters"] == expected_exporters
+    assert config_manager.config._config["service"]["pipelines"] == expected_pipelines
+
+
+def test_add_external_configs_adds_components_to_requested_pipelines():
+    config_manager = ConfigManager("otelcol/0", "otelcol", "", "", insecure_skip_verify=True)
+
+    config_manager.add_external_configs(
+        [
+            {
+                "config_yaml": """
+receivers:
+  prometheus/custom:
+    config:
+      scrape_configs:
+        - job_name: custom
+          static_configs:
+            - targets: ["0.0.0.0:9000"]
+""",
+                "pipelines": ["metrics"],
+            }
+        ]
+    )
+
+    receiver_name = "prometheus/custom/otelcol/0"
+    assert receiver_name in config_manager.config._config["receivers"]
+    assert (
+        receiver_name
+        in config_manager.config._config["service"]["pipelines"]["metrics/otelcol/0"]["receivers"]
+    )
+
+
+@pytest.mark.parametrize(
+    "external_configs",
+    [
+        [{"config_yaml": "[]", "pipelines": ["metrics"]}],
+        [{"config_yaml": "receivers: []", "pipelines": ["metrics"]}],
+        ["not-a-dict"],
+    ],
+)
+def test_add_external_configs_skips_malformed_entries(external_configs):
+    config_manager = ConfigManager("otelcol/0", "otelcol", "", "", insecure_skip_verify=True)
+    initial_config = copy.deepcopy(config_manager.config._config)
+
+    config_manager.add_external_configs(external_configs)
+
+    assert config_manager.config._config == initial_config
+
+
+def test_self_ingest_loop_breaker_invariant_all_log_exporters():
+    """Every log exporter is covered by the loop-breaker; non-log exporters are not."""
+    unit_name = "otelcol/0"
+    filter_name = f"filter/internal-telemetry-loop-breaker/{unit_name}"
+    config_manager = ConfigManager(unit_name, "0", "", "")
+    config_manager.add_log_forwarding(
+        endpoints=[{"url": "http://loki/loki/api/v1/push"}],
+        insecure_skip_verify=False,
+    )
+    config_manager.add_cloud_integrator(
+        username=None,
+        password=None,
+        prometheus_url=None,
+        loki_url="http://cloud-loki/loki/api/v1/push",
+        tempo_url=None,
+    )
+    config_manager.add_otlp_forwarding(
+        relation_map={
+            0: OtlpEndpoint(
+                protocol="http",
+                endpoint="http://otlp-logs:4318",
+                telemetries=["logs"],
+                insecure=True,
+            ),
+        }
+    )
+    config_manager.add_remote_write(endpoints=[{"url": "http://mimir/api/v1/push"}])
+
+    built = yaml.safe_load(config_manager.config.build())
+    pipelines = built["service"]["pipelines"]
+    logs_pipeline = pipelines[f"logs/{unit_name}"]
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    assert filter_name in logs_pipeline.get("processors", [])
+
+    for exporter_id in logs_pipeline.get("exporters", []):
+        if exporter_id.split("/")[0] in ("nop", "debug"):
+            continue
+        covering = [c for c in conditions if exporter_id in c]
+        assert covering, f"log exporter '{exporter_id}' not covered by loop-breaker filter"
+        assert all(
+            'instrumentation_scope.attributes["otelcol.signal"] == "logs"' in c for c in covering
+        )
+    assert any("otlphttp/rel-" in c for c in conditions)
+    assert not any("prometheusremotewrite" in c for c in conditions)

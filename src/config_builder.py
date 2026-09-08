@@ -1,13 +1,22 @@
 """Helper module to build the configuration for OpenTelemetry Collector."""
 
+import copy
 import hashlib
 import logging
 from enum import Enum, unique
-from typing import Any, Dict, List, Literal, Optional, Union
+import re
+from typing import Any, Dict, List, Literal, Optional, Set, Union, cast
 
 import yaml
 
-from constants import INTERNAL_TELEMETRY_LOG_FILE, SERVER_CERT_PATH, SERVER_CERT_PRIVATE_KEY_PATH
+from constants import (
+    CUSTOM_COMPONENT_ID,
+    INTERNAL_LOGS_FILTER_ID,
+    INTERNAL_TELEMETRY_SERVICE_NAME,
+    NON_LOOPING_EXPORTER_PREFIXES,
+    SERVER_CERT_PATH,
+    SERVER_CERT_PRIVATE_KEY_PATH,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +61,119 @@ class Port(int, Enum):
     """HTTP endpoint for Jaeger Thrift protocol"""
     zipkin = 9411
     """HTTP endpoint for Zipkin protocol"""
+    node_exporter = 9100
+    """HTTP endpoint for node-exporter metrics"""
 
+
+def _parse_port_override(pair: str, valid_names: Set[str]) -> tuple:
+    """Parse and validate a single port override string of the form "name=port".
+
+    Args:
+        pair: A single override string, e.g. "loki_http=3501".
+        valid_names: Set of accepted port names.
+
+    Returns:
+        A (name, value) tuple.
+
+    Raises:
+        ValueError: If the format is invalid, the name is unknown, the value
+            is not an integer, or the value is outside the 1-65535 range.
+    """
+    if "=" not in pair:
+        raise ValueError(f"Invalid format '{pair}': expected 'name=port'")
+    name, _, raw_value = pair.partition("=")
+    name = name.strip()
+    if name not in valid_names:
+        raise ValueError(f"Unknown port name '{name}'. Valid names: {', '.join(sorted(valid_names))}")
+    try:
+        value = int(raw_value.strip())
+    except ValueError:
+        raise ValueError(f"Port value for '{name}' must be an integer, got '{raw_value.strip()}'")
+    if not (1 <= value <= 65535):
+        raise ValueError(f"Port value for '{name}' must be between 1 and 65535, got {value}")
+    return name, value
+
+
+def _check_no_duplicate_ports(ports: Dict[str, int]) -> None:
+    """Verify that no two port names resolve to the same port number.
+
+    Args:
+        ports: The complete port map to validate.
+
+    Raises:
+        ValueError: If two or more port names share the same port number.
+    """
+    seen: Dict[int, str] = {}
+    for port_name, port_value in ports.items():
+        if port_value in seen:
+            raise ValueError(
+                f"Duplicate port {port_value}: assigned to both '{seen[port_value]}' and '{port_name}'"
+            )
+        seen[port_value] = port_name
+
+
+def _memory_limiter_processors_to_first_in_pipelines(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure that memory_limiter processors are first in the pipelines."""
+    config_copy = copy.deepcopy(config)
+    for pipeline in config_copy.get("service", {}).get("pipelines", {}).values():
+        processors = pipeline.get("processors", [])
+        mem_limiters = [p for p in processors if p.startswith("memory_limiter")]
+        others = [p for p in processors if not p.startswith("memory_limiter")]
+        pipeline["processors"] = mem_limiters + others
+    return config_copy
+
+
+def _prioritize_user_memory_limiter_processors(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure that the correct memory_limiter processors are configured.
+
+    The user can manage the memory_limiter processors via the `memory_limit_percentage` and
+    `processors` config options. If multiple memory_limiter processors are configured, this
+    method removes the default one and keeps the user-defined one(s); shifting the
+    responsibility to the user.
+    """
+    config_copy = copy.deepcopy(config)
+    processors = config_copy.get("processors", {})
+    mem_limiter_names = [name for name in processors if name.startswith("memory_limiter")]
+    only_default_exists = len(mem_limiter_names) == 1 and mem_limiter_names[0] == "memory_limiter"
+    if only_default_exists:
+        return config_copy
+
+    # user-defined memory limiter exists, remove the default one.
+    for name in mem_limiter_names:
+        default = name.startswith("memory_limiter") and CUSTOM_COMPONENT_ID not in name
+        if default:
+            config_copy.get("processors", {}).pop(name)
+            for pipeline in config_copy.get("service", {}).get("pipelines", {}).values():
+                if name in pipeline.get("processors", []):
+                    pipeline["processors"].remove(name)
+    return config_copy
+
+
+def build_port_map(overrides: str = "") -> Dict[str, int]:
+    """Build a port map from the Port enum defaults and optional overrides.
+
+    Args:
+        overrides: Comma-separated string of port overrides in the form
+            "name=port[,name=port,...]". For example: "loki_http=3501,otlp_grpc=4320".
+            An empty string returns the default port map unchanged.
+
+    Returns:
+        A dict mapping each Port name to its effective port number.
+
+    Raises:
+        ValueError: If a pair is malformed, a port name is unknown, a port
+            value is not a valid integer, is out of range (1-65535), or two
+            ports resolve to the same value.
+    """
+    ports: Dict[str, int] = {p.name: p.value for p in Port}
+    if not overrides.strip():
+        return ports
+    for pair in overrides.split(","):
+        if pair := pair.strip():
+            name, value = _parse_port_override(pair, set(ports))
+            ports[name] = value
+    _check_no_duplicate_ports(ports)
+    return ports
 
 @unique
 class Component(str, Enum):
@@ -93,6 +214,9 @@ class ConfigBuilder:
         global_scrape_timeout: str,
         receiver_tls: bool = False,
         exporter_skip_verify: bool = False,
+        ports: Optional[Dict[str, int]] = None,
+        internal_host: str = "localhost",
+        topology_labels: Optional[Dict[str, str]] = None,
     ):
         """Generate an empty OpenTelemetry collector config.
 
@@ -103,6 +227,9 @@ class ConfigBuilder:
             global_scrape_timeout: value for `scrape_timeout` in all prometheus receivers
             receiver_tls: whether to inject TLS config in all receivers on build
             exporter_skip_verify: value for `insecure_skip_verify` in all exporters
+            ports: port map produced by build_port_map(); if None the enum defaults are used
+            internal_host: FQDN of the unit, used as OTLP self-export endpoint for TLS SAN matching
+            topology_labels: Juju topology labels for Loki resource attribution
         """
         self._config = {
             "extensions": {},
@@ -122,6 +249,9 @@ class ConfigBuilder:
         self._exporter_skip_verify = exporter_skip_verify
         self._scrape_interval = global_scrape_interval
         self._scrape_timeout = global_scrape_timeout
+        self._ports: Dict[str, int] = ports if ports is not None else build_port_map()
+        self._internal_host = internal_host
+        self._topology_labels = topology_labels
 
     def build(self) -> str:
         """Build the final configuration and return it as a YAML string.
@@ -135,13 +265,17 @@ class ConfigBuilder:
             str: A YAML string representing the complete configuration.
         """
         self._add_missing_nop_exporters()
+        self._populate_loop_breaker_filter()
         if self._receiver_tls:
             self._add_tls_to_all_receivers()
         self._set_prometheus_receiver_global_timeout_and_interval(
             self._scrape_interval,
             self._scrape_timeout,
         )
+        self._sanitize_prometheus_scrape_configs()
         self._add_exporter_insecure_skip_verify(self._exporter_skip_verify)
+        config = _memory_limiter_processors_to_first_in_pipelines(self._config)
+        self._config = _prioritize_user_memory_limiter_processors(config)
         return yaml.safe_dump(self._config)
 
     @property
@@ -166,8 +300,8 @@ class ConfigBuilder:
             f"otlp/{self._hostname}",
             {
                 "protocols": {
-                    "http": {"endpoint": f"0.0.0.0:{Port.otlp_http.value}"},
-                    "grpc": {"endpoint": f"0.0.0.0:{Port.otlp_grpc.value}"},
+                    "http": {"endpoint": f"0.0.0.0:{self._ports[Port.otlp_http.name]}"},
+                    "grpc": {"endpoint": f"0.0.0.0:{self._ports[Port.otlp_grpc.name]}"},
                 },
             },
             pipelines=[
@@ -178,19 +312,26 @@ class ConfigBuilder:
         )
         # FIXME https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/11780
         # Add TLS config to extensions
-        self.add_extension("health_check", {"endpoint": f"0.0.0.0:{Port.health.value}"})
+        self.add_extension("health_check", {"endpoint": f"0.0.0.0:{self._ports[Port.health.name]}"})
+        self._add_internal_telemetry_loop_breaker()
         self.add_telemetry(
-            "logs",
+            "metrics",
             {
-                "level": "INFO",
-                "disable_stacktrace": True,
-                # Write to a designated log file for internal telemetry logs. Otherwise, they go to
-                # stderr and syslog by default. This is rotated by logrotate and is configured
-                # elsewhere in the _configure_logrotate method.
-                "output_paths": [INTERNAL_TELEMETRY_LOG_FILE],
+                "level": "normal",
+                "readers": [
+                    {
+                        "pull": {
+                            "exporter": {
+                                "prometheus": {
+                                    "host": "0.0.0.0",
+                                    "port": self._ports[Port.metrics.name],
+                                }
+                            }
+                        }
+                    }
+                ],
             },
         )
-        self.add_telemetry("metrics", {"level": "normal"})
 
     def add_component(
         self,
@@ -250,6 +391,71 @@ class ConfigBuilder:
         """
         # https://opentelemetry.io/docs/collector/internal-telemetry
         self._config["service"]["telemetry"][category] = telem_config
+
+    def _populate_loop_breaker_filter(self):
+        """Populate the internal-telemetry loop-breaker filter's drop conditions."""
+        filter_name = f"filter/{INTERNAL_LOGS_FILTER_ID}/{self._unit_name}"
+        if filter_name not in self._config["processors"]:
+            return
+        log_exporter_ids: List[str] = []
+        for pipeline_name, pipeline in self._config["service"]["pipelines"].items():
+            if pipeline_name.split("/")[0] != "logs":
+                continue
+            for exporter_id in pipeline.get("exporters", []):
+                if (
+                    exporter_id.split("/")[0] not in NON_LOOPING_EXPORTER_PREFIXES
+                    and exporter_id not in log_exporter_ids
+                ):
+                    log_exporter_ids.append(exporter_id)
+        self._config["processors"][filter_name]["logs"]["log_record"] = [
+            f'instrumentation_scope.attributes["otelcol.component.id"] == "{exporter_id}" '
+            f'and instrumentation_scope.attributes["otelcol.signal"] == "logs"'
+            for exporter_id in log_exporter_ids
+        ]
+
+    def _add_internal_telemetry_loop_breaker(self):
+        """Configure the loop-breaker and self-ingestion of the collector's internal telemetry."""
+        self.add_component(
+            Component.processor,
+            f"filter/{INTERNAL_LOGS_FILTER_ID}/{self._unit_name}",
+            {
+                "error_mode": "ignore",
+                "logs": {"log_record": []},
+            },
+            pipelines=[f"logs/{self._unit_name}"],
+        )
+        internal_logs_otlp_exporter: Dict[str, Any] = {
+            "protocol": "http/protobuf",
+            "endpoint": (
+                f"https://{self._internal_host}:{Port.otlp_http.value}"
+                if self._receiver_tls
+                else f"http://localhost:{Port.otlp_http.value}"
+            ),
+        }
+        resource: Dict[str, Any] = {
+            "service.name": INTERNAL_TELEMETRY_SERVICE_NAME,
+            "loki.format": "logfmt",
+        }
+        if self._topology_labels:
+            resource.update(self._topology_labels)
+            if "juju_unit" in self._topology_labels:
+                resource["service.instance.id"] = self._topology_labels["juju_unit"]
+            resource["loki.resource.labels"] = ", ".join(sorted(self._topology_labels))
+        self._config["service"]["telemetry"]["resource"] = resource
+        self.add_telemetry(
+            "logs",
+            {
+                "level": "INFO",
+                "disable_stacktrace": True,
+                "processors": [
+                    {
+                        "batch": {
+                            "exporter": {"otlp": internal_logs_otlp_exporter},
+                        }
+                    }
+                ],
+            },
+        )
 
     def _add_to_pipeline(self, name: str, component: Component, pipelines: List[str]):
         """Add a pipeline component to the service::pipelines config.
@@ -333,8 +539,48 @@ class ConfigBuilder:
         """Set the `scrape_interval` and `scrape_timeout` for all scrape_configs in every prometheus receiver."""
         receivers = self._config.get("receivers", {})
         for name, receiver in receivers.items():
-            if name.split("/")[0] == "prometheus":
+            if name.startswith("prometheus/"):
                 scrape_configs = receiver.get("config", {}).get("scrape_configs", [])
                 for scrape_cfg in scrape_configs:
                     scrape_cfg["scrape_interval"] = interval
                     scrape_cfg["scrape_timeout"] = timeout
+
+    @classmethod
+    def _escape_dollars(cls, value: Any) -> Any:
+        """Recursively escape bare `$` signs in strings within a nested structure."""
+        match value:
+            case str():
+                return re.sub(r'(?<!\$)\$(?!\$)', '$$', value)
+            case dict():
+                return {k: cls._escape_dollars(v) for k, v in value.items()}
+            case list():
+                return [cls._escape_dollars(item) for item in value]
+            case _:
+                return value
+
+    @classmethod
+    def _sanitize_escape_prometheus_scrape_configs(cls, scrape_configs: List[Dict]) -> List[Dict]:
+        """Escape $ signs in Prometheus scrape configs for otelcol compatibility.
+
+        The OpenTelemetry Collector interprets ${VAR} and $VAR as environment-variable
+        references. Prometheus relabeling rules legitimately use ${1}, ${2}, etc. as
+        capture-group back-references. To prevent otelcol from misinterpreting these,
+        every `$` must be doubled to `$$`, which otelcol treats as a literal dollar sign.
+
+        Already-escaped `$$` sequences are left unchanged (idempotent).
+
+        Args:
+            scrape_configs: list of scrape config dicts (may contain nested dicts/lists/strings).
+
+        Returns:
+            A deep copy of the scrape configs with all bare `$` signs escaped to `$$`.
+        """
+        return [cast(Dict, cls._escape_dollars(copy.deepcopy(job))) for job in scrape_configs]
+
+    def _sanitize_prometheus_scrape_configs(self):
+        """Escape any $ in any prometheus receiver's scrape configs."""
+        for name, receiver in self._config.get("receivers", {}).items():
+            if name.startswith("prometheus/"):
+                scrape_configs = receiver.get("config", {}).get("scrape_configs", [])
+                sanitized_scrape_configs = self._sanitize_escape_prometheus_scrape_configs(scrape_configs)
+                receiver["config"]["scrape_configs"] = sanitized_scrape_configs

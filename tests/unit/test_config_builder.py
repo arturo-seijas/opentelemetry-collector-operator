@@ -3,13 +3,11 @@
 
 """Feature: Opentelemetry-collector config builder."""
 
-from copy import deepcopy
-
 import pytest
 import yaml
 import copy
 
-from config_builder import ConfigBuilder, Component
+from src.config_builder import ConfigBuilder, Component, Port, build_port_map
 
 
 @pytest.mark.parametrize("pipelines", ([], ["logs", "metrics", "traces"]))
@@ -225,7 +223,7 @@ def test_receivers_tls_known_protocols():
 def test_insecure_skip_verify():
     # GIVEN an empty config without exporters
     config = ConfigBuilder("", "", "", "")
-    config_copy = deepcopy(config)
+    config_copy = copy.deepcopy(config)
     # WHEN updating the tls::insecure_skip_verify exporter configuration
     config._add_exporter_insecure_skip_verify(False)
     # THEN it has no effect on the rendered config
@@ -300,3 +298,418 @@ def test_global_scrape_timeout_and_interval():
             for scrape_cfg in receiver["config"]["scrape_configs"]:
                 assert scrape_cfg["scrape_interval"] == "1m"
                 assert scrape_cfg["scrape_timeout"] == "10s"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature: build_port_map
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("overrides", ["", "   "])
+def test_build_port_map_returns_defaults(overrides):
+    """An empty or whitespace-only override string returns the Port enum defaults unchanged."""
+    # GIVEN an empty or whitespace-only override string
+    # WHEN building the port map
+    port_map = build_port_map(overrides)
+    # THEN all ports match the enum defaults
+    for port in Port:
+        assert port_map[port.name] == port.value
+
+
+def test_build_port_map_single_override():
+    """A single override changes only the specified port."""
+    # GIVEN an override for a single port
+    overrides = "loki_http=3501"
+    # WHEN building the port map
+    port_map = build_port_map(overrides)
+    # THEN the overridden port has the new value
+    assert port_map["loki_http"] == 3501
+    # AND all other ports keep their defaults
+    for port in Port:
+        if port.name != "loki_http":
+            assert port_map[port.name] == port.value
+
+
+def test_build_port_map_multiple_overrides():
+    """Multiple comma-separated overrides are all applied."""
+    # GIVEN overrides for two ports
+    overrides = "loki_http=3501,otlp_grpc=4320"
+    # WHEN building the port map
+    port_map = build_port_map(overrides)
+    # THEN both ports have the overridden values
+    assert port_map["loki_http"] == 3501
+    assert port_map["otlp_grpc"] == 4320
+
+
+def test_build_port_map_whitespace_is_stripped():
+    """Leading/trailing whitespace around names and values is accepted."""
+    # GIVEN overrides with extra whitespace
+    overrides = "  loki_http = 3501 , otlp_grpc = 4320  "
+    # WHEN building the port map
+    port_map = build_port_map(overrides)
+    # THEN the overrides are applied correctly
+    assert port_map["loki_http"] == 3501
+    assert port_map["otlp_grpc"] == 4320
+
+
+@pytest.mark.parametrize(
+    "overrides, expected_error",
+    [
+        ("unknown_port=9999", "Unknown port name"),
+        ("loki_http=not_a_number", "must be an integer"),
+        ("loki_http3501", "Invalid format"),
+        ("loki_http=0", "between 1 and 65535"),
+        ("loki_http=65536", "between 1 and 65535"),
+        ("loki_http=-1", "between 1 and 65535"),
+        ("loki_http=4317", "Duplicate port"),  # 4317 is the default for otlp_grpc
+    ],
+)
+def test_build_port_map_invalid_input_raises(overrides, expected_error):
+    """Invalid override strings raise ValueError with a descriptive message."""
+    # GIVEN an invalid override string
+    # WHEN building the port map THEN a ValueError is raised with the expected message
+    with pytest.raises(ValueError, match=expected_error):
+        build_port_map(overrides)
+
+
+def test_config_builder_accepts_port_overrides():
+    """ConfigBuilder uses the provided port map in add_default_config."""
+    # GIVEN a port map with overridden ports
+    port_map = build_port_map("otlp_http=4400,otlp_grpc=4401,health=13200,metrics=8889")
+    # WHEN creating a ConfigBuilder with those ports and building the config
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s", ports=port_map)
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    # THEN the OTLP receiver endpoints use the overridden ports
+    otlp_receiver = built["receivers"]["otlp/host0"]
+    assert str(4400) in otlp_receiver["protocols"]["http"]["endpoint"]
+    assert str(4401) in otlp_receiver["protocols"]["grpc"]["endpoint"]
+    # AND the health_check extension uses the overridden port
+    assert str(13200) in built["extensions"]["health_check"]["endpoint"]
+    # AND the internal telemetry metrics endpoint uses the overridden port
+    prometheus_reader = built["service"]["telemetry"]["metrics"]["readers"][0]["pull"]["exporter"]["prometheus"]
+    assert prometheus_reader["port"] == 8889
+
+
+@pytest.mark.parametrize(
+    "input_replacement,expected_replacement",
+    [
+        # Single capture group ${1}
+        ("${1}.juju-73d163-3-lxd-0", "$${1}.juju-73d163-3-lxd-0"),
+        # Multiple capture groups ${1} and ${2}
+        ("${1}-${2}", "$${1}-$${2}"),
+        # Plain $var env-var-like
+        ("$MY_VAR", "$$MY_VAR"),
+        # Already escaped $$ — must be idempotent
+        ("$${1}.juju-73d163-3-lxd-0", "$${1}.juju-73d163-3-lxd-0"),
+        # No dollar signs — unchanged
+        ("static-replacement", "static-replacement"),
+        # Empty string
+        ("", ""),
+    ],
+)
+def test_sanitize_escape_prometheus_scrape_configs_parametrized(
+    input_replacement, expected_replacement
+):
+    """Test that bare $ signs in relabel_configs replacement fields are properly escaped."""
+    # GIVEN a scrape config with a relabeling rule containing a replacement value
+    scrape_configs = [
+        {
+            "job_name": "test_job",
+            "relabel_configs": [
+                {
+                    "action": "replace",
+                    "regex": "([^.]+).*",
+                    "replacement": input_replacement,
+                }
+            ],
+        }
+    ]
+
+    expected_scrape_configs = [
+        {
+            "job_name": "test_job",
+            "relabel_configs": [
+                {
+                    "action": "replace",
+                    "regex": "([^.]+).*",
+                    "replacement": expected_replacement,
+                }
+            ],
+        }
+    ]
+
+    # WHEN sanitize_escape_prometheus_scrape_configs is called
+    result = ConfigBuilder._sanitize_escape_prometheus_scrape_configs(scrape_configs)
+
+    # THEN the scrape config is correctly escaped
+    assert result == expected_scrape_configs
+
+
+def test_sanitize_escape_prometheus_scrape_configs_multiple_jobs_mixed():
+    """Test that multiple jobs are handled correctly, including already-escaped ones."""
+    # GIVEN two jobs: one with bare $ signs, one already escaped
+    scrape_configs = [
+        {
+            "job_name": "job_bare",
+            "relabel_configs": [{"replacement": "${1}.host"}],
+        },
+        {
+            "job_name": "job_already_escaped",
+            "relabel_configs": [{"replacement": "$${1}.host"}],
+        },
+    ]
+
+    # WHEN sanitize_escape_prometheus_scrape_configs is called
+    result = ConfigBuilder._sanitize_escape_prometheus_scrape_configs(scrape_configs)
+
+    # THEN bare $ in job_bare is escaped
+    assert result[0]["relabel_configs"][0]["replacement"] == "$${1}.host"
+    # AND already-escaped $$ in job_already_escaped is unchanged
+    assert result[1]["relabel_configs"][0]["replacement"] == "$${1}.host"
+
+
+def test_sanitize_escape_prometheus_scrape_configs_no_mutation():
+    """Test that the original input is not mutated (deep copy guarantee)."""
+    # GIVEN a scrape config with bare $ signs
+    original = [{"relabel_configs": [{"replacement": "${1}.host"}]}]
+    original_copy = copy.deepcopy(original)
+
+    # WHEN sanitize_escape_prometheus_scrape_configs is called
+    ConfigBuilder._sanitize_escape_prometheus_scrape_configs(original)
+
+    # THEN the original input is not mutated
+    assert original == original_copy
+
+
+def test_sanitize_escape_prometheus_scrape_configs_idempotent():
+    """Test that calling the method twice returns the same result (idempotent)."""
+    # GIVEN a scrape config with bare $ signs
+    scrape_configs = [{"relabel_configs": [{"replacement": "${1}.host"}]}]
+
+    # WHEN sanitize_escape_prometheus_scrape_configs is called twice
+    once = ConfigBuilder._sanitize_escape_prometheus_scrape_configs(scrape_configs)
+    twice = ConfigBuilder._sanitize_escape_prometheus_scrape_configs(once)
+
+    # THEN the result is the same both times
+    assert once == twice
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Feature: Internal telemetry forwarding (loop-breaker + OTLP self-export)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def test_default_internal_logs_self_export_plaintext():
+    """Without TLS: self-export over HTTP to localhost."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    telemetry = built["service"]["telemetry"]
+    assert telemetry["resource"]["service.name"] == "otelcol-internal"
+    assert telemetry["resource"]["loki.format"] == "logfmt"
+    logs_cfg = telemetry["logs"]
+    assert logs_cfg["level"] == "INFO"
+    assert logs_cfg["disable_stacktrace"] is True
+    batch_proc = logs_cfg["processors"][0]["batch"]
+    assert batch_proc["exporter"]["otlp"]["endpoint"] == "http://localhost:4318"
+    assert batch_proc["exporter"]["otlp"]["protocol"] == "http/protobuf"
+    assert "tls" not in batch_proc["exporter"]["otlp"]
+
+
+def test_default_internal_logs_self_export_tls():
+    """With TLS: self-export over HTTPS to FQDN."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s", receiver_tls=True, internal_host="my-fqdn.example.com")
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    batch_proc = built["service"]["telemetry"]["logs"]["processors"][0]["batch"]
+    assert batch_proc["exporter"]["otlp"]["endpoint"] == "https://my-fqdn.example.com:4318"
+
+
+def test_internal_logs_topology_labels_in_resource():
+    """Topology labels are promoted to telemetry resource."""
+    topology = {
+        "juju_charm": "my-charm",
+        "juju_model": "mymodel",
+        "juju_model_uuid": "abcd-1234",
+        "juju_application": "my-app",
+        "juju_unit": "my-app/0",
+    }
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s", topology_labels=topology)
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    resource = built["service"]["telemetry"]["resource"]
+    assert resource["juju_charm"] == "my-charm"
+    assert resource["juju_model"] == "mymodel"
+    assert resource["juju_model_uuid"] == "abcd-1234"
+    assert resource["juju_application"] == "my-app"
+    assert resource["juju_unit"] == "my-app/0"
+    assert resource["service.instance.id"] == "my-app/0"
+    labels = resource["loki.resource.labels"]
+    for key in ["juju_application", "juju_charm", "juju_model", "juju_model_uuid", "juju_unit"]:
+        assert key in labels
+
+
+def test_internal_logs_without_topology_labels():
+    """Without topology: resource has only service.name and loki.format."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    resource = built["service"]["telemetry"]["resource"]
+    assert resource == {"service.name": "otelcol-internal", "loki.format": "logfmt"}
+
+
+def test_default_internal_logs_loop_breaker_filter_present():
+    """The loop-breaker filter processor exists and is wired into the logs pipeline."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    assert filter_name in built["processors"]
+    assert built["processors"][filter_name]["error_mode"] == "ignore"
+    assert "log_record" in built["processors"][filter_name]["logs"]
+    assert filter_name in built["service"]["pipelines"]["logs/unit/0"]["processors"]
+
+
+def test_loop_breaker_filter_conditions_populated_from_logs_exporters():
+    """Filter conditions are dynamically populated from logs-pipeline exporters."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    # Add a loki exporter to the logs pipeline
+    config.add_component(
+        Component.exporter,
+        "loki/send-loki-logs/0",
+        {"endpoint": "http://loki:3100"},
+        pipelines=["logs/unit/0"],
+    )
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    assert len(conditions) == 1
+    assert "loki/send-loki-logs/0" in conditions[0]
+    assert "otelcol.component.id" in conditions[0]
+    assert "otelcol.signal" in conditions[0]
+    assert '"logs"' in conditions[0]
+
+
+def test_loop_breaker_filter_excludes_nop_and_debug():
+    """Nop and debug exporters are excluded from filter conditions."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    config.add_component(
+        Component.exporter,
+        "loki/send-loki-logs/0",
+        {"endpoint": "http://loki:3100"},
+        pipelines=["logs/unit/0"],
+    )
+    config.add_component(
+        Component.exporter,
+        "nop",
+        {},
+        pipelines=["logs/unit/0"],
+    )
+    config.add_component(
+        Component.exporter,
+        "debug",
+        {"verbosity": "normal"},
+        pipelines=["logs/unit/0"],
+    )
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    # Only the loki exporter should be in conditions, not nop or debug
+    assert len(conditions) == 1
+    assert "loki/send-loki-logs/0" in conditions[0]
+    assert all("debug" not in c for c in conditions)
+    assert all("nop" not in c for c in conditions)
+
+
+def test_loop_breaker_filter_conditions_empty_without_exporters():
+    """With no real log exporters, conditions list is empty."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    # Only the nop exporter should be present, which is excluded
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    assert conditions == []
+
+
+def test_loop_breaker_filter_covers_multiple_logs_exporters():
+    """Multiple logs-pipeline exporters each get a condition."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    config.add_component(
+        Component.exporter,
+        "loki/send-loki-logs/0",
+        {"endpoint": "http://loki:3100"},
+        pipelines=["logs/unit/0"],
+    )
+    config.add_component(
+        Component.exporter,
+        "otlphttp/rel-1/otelcol/0",
+        {"endpoint": "http://otlp:4318"},
+        pipelines=["logs/unit/0"],
+    )
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    assert len(conditions) == 2
+    assert any("loki/send-loki-logs/0" in c for c in conditions)
+    assert any("otlphttp/rel-1/otelcol/0" in c for c in conditions)
+
+
+def test_loop_breaker_filter_covers_exporters_on_custom_logs_pipelines():
+    """User-supplied custom logs pipelines also get their exporters covered by the loop-breaker."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    config.add_component(
+        Component.exporter,
+        "loki/send-loki-logs/0",
+        {"endpoint": "http://loki:3100"},
+        pipelines=["logs/unit/0"],
+    )
+    config.add_component(
+        Component.exporter,
+        "otlphttp/user-custom",
+        {"endpoint": "http://custom:4318"},
+        pipelines=["logs/custom"],
+    )
+    config.add_component(
+        Component.exporter,
+        "kafka/user-bare",
+        {"endpoint": "http://kafka:9092"},
+        pipelines=["logs"],
+    )
+    config.add_component(
+        Component.exporter,
+        "prometheusremotewrite/user",
+        {"endpoint": "http://mimir:9009"},
+        pipelines=["metrics/custom"],
+    )
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    covered = {
+        eid
+        for eid in ("loki/send-loki-logs/0", "otlphttp/user-custom", "kafka/user-bare")
+        if any(eid in c for c in conditions)
+    }
+    assert covered == {"loki/send-loki-logs/0", "otlphttp/user-custom", "kafka/user-bare"}
+    assert not any("prometheusremotewrite" in c for c in conditions)
+
+
+def test_loop_breaker_filter_deduplicates_shared_exporter_across_logs_pipelines():
+    """An exporter shared by multiple logs pipelines yields exactly one drop condition."""
+    config = ConfigBuilder("unit/0", "host0", "1m", "10s")
+    config.add_default_config()
+    config.add_component(
+        Component.exporter,
+        "loki/send-loki-logs/0",
+        {"endpoint": "http://loki:3100"},
+        pipelines=["logs/unit/0", "logs/custom"],
+    )
+    built = yaml.safe_load(config.build())
+    filter_name = "filter/internal-telemetry-loop-breaker/unit/0"
+    conditions = built["processors"][filter_name]["logs"]["log_record"]
+    assert sum("loki/send-loki-logs/0" in c for c in conditions) == 1

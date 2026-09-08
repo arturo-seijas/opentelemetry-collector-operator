@@ -9,11 +9,12 @@ import socket
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, cast, get_args
+from typing import Any, Dict, List, Optional, cast, get_args
 
 import yaml
+from charmlibs.interfaces.otlp import OtlpEndpoint, OtlpRequirer, RuleStore
 from charmlibs.pathops import PathProtocol
-from charms.certificate_transfer_interface.v1.certificate_transfer import (
+from charmlibs.interfaces.certificate_transfer import (
     CertificateTransferRequires,
 )
 from charms.grafana_cloud_integrator.v0.cloud_config_requirer import (
@@ -21,6 +22,7 @@ from charms.grafana_cloud_integrator.v0.cloud_config_requirer import (
 )
 from charms.grafana_k8s.v0.grafana_dashboard import GrafanaDashboardProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer, LokiPushApiProvider
+from charms.opentelemetry_collector_integrator.v0.opentelemetry_collector_integrator import OtelcolIntegratorRequirer
 from charms.prometheus_k8s.v0.prometheus_scrape import (
     MetricsEndpointConsumer,
 )
@@ -28,8 +30,8 @@ from charms.prometheus_k8s.v1.prometheus_remote_write import (
     PrometheusRemoteWriteConsumer,
 )
 from charms.pyroscope_coordinator_k8s.v0.profiling import (
-    ProfilingEndpointRequirer,
     ProfilingEndpointProvider,
+    ProfilingEndpointRequirer,
 )
 from charms.tempo_coordinator_k8s.v0.tracing import (
     ReceiverProtocol,
@@ -43,14 +45,16 @@ from charms.tls_certificates_interface.v4.tls_certificates import (
     Mode,
     TLSCertificatesRequiresV4,
 )
-from cosl import LZMABase64
+from cosl.rules import JujuTopology
+from cosl.utils import LZMABase64
 from ops import CharmBase, tracing
 from ops.model import Relation
 
-from config_builder import Port, sha256
+from config_builder import Port, build_port_map, sha256
 from constants import (
     DASHBOARDS_DEST_PATH,
     DASHBOARDS_SRC_PATH,
+    EXTERNAL_CONFIG_SECRETS_DIR,
     LOKI_RULES_DEST_PATH,
     LOKI_RULES_SRC_PATH,
     METRICS_RULES_DEST_PATH,
@@ -62,14 +66,17 @@ logger = logging.getLogger(__name__)
 ProfilingEndpoint = namedtuple("ProfilingEndpoint", "endpoint, insecure")
 
 
-def cleanup():
+def cleanup(charm_root: Path):
     """Cleanup folders for alerts and dashboards.
 
     This function should be called before all integrations to ensure the charm works holistically.
+    The DEST directories are resolved against ``charm_root`` (an absolute path) so that cleanup
+    targets the very same folders that `receive_loki_logs`/`scrape_metrics`/`send_otlp` read and
+    write, regardless of the process' current working directory.
     """
-    shutil.rmtree(METRICS_RULES_DEST_PATH, ignore_errors=True)
-    shutil.rmtree(LOKI_RULES_DEST_PATH, ignore_errors=True)
-    shutil.rmtree(DASHBOARDS_DEST_PATH, ignore_errors=True)
+    shutil.rmtree(charm_root.joinpath(*METRICS_RULES_DEST_PATH.split("/")), ignore_errors=True)
+    shutil.rmtree(charm_root.joinpath(*LOKI_RULES_DEST_PATH.split("/")), ignore_errors=True)
+    shutil.rmtree(charm_root.joinpath(*DASHBOARDS_DEST_PATH.split("/")), ignore_errors=True)
 
 
 def _add_alerts(alerts: Dict, dest_path: Path):
@@ -88,19 +95,26 @@ def _add_alerts(alerts: Dict, dest_path: Path):
         logger.debug(f"updated alert rules file {rule_file.as_posix()}")
 
 
-def receive_loki_logs(charm: CharmBase, tls: bool):
+def receive_external_configs(charm: CharmBase) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Integrate with otelcol-integrator charm via the external-config relation endpoint."""
+    otelcol_requirer = OtelcolIntegratorRequirer(charm.model, "external-config", EXTERNAL_CONFIG_SECRETS_DIR)
+    return otelcol_requirer.retrieve_external_configs(), otelcol_requirer.secret_files
+
+def receive_loki_logs(charm: CharmBase, tls: bool, ports: Optional[Dict[str, int]] = None):
     """Integrate with other charms via the receive-loki-logs relation endpoint.
 
     This function must be called before `send_loki_logs`, so that the charm
     can gather all the alerts from relation data before sending them all
     to Loki.
     """
+    if ports is None:
+        ports = build_port_map()
     forward_alert_rules = cast(bool, charm.config.get("forward_alert_rules"))
     charm_root = charm.charm_dir.absolute()
     loki_provider = LokiPushApiProvider(
         charm,
         relation_name="receive-loki-logs",
-        port=Port.loki_http.value,
+        port=ports[Port.loki_http.name],
         scheme="https" if tls else "http",
     )
     charm.__setattr__("loki_provider", loki_provider)
@@ -140,7 +154,7 @@ def send_loki_logs(charm: CharmBase) -> List[Dict]:
     charm.__setattr__("loki_consumer", loki_consumer)
     # TODO: Luca: probably don't need this anymore
     loki_consumer.reload_alerts()
-    return loki_consumer.loki_endpoints
+    return sorted(loki_consumer.loki_endpoints, key=lambda endpoint: endpoint["url"])
 
 
 def key_value_pair_string_to_dict(key_value_pair: str) -> dict:
@@ -231,20 +245,20 @@ def send_remote_write(charm: CharmBase) -> List[Dict[str, str]]:
         peer_relation_name="peers",
     )
     charm.__setattr__("remote_write", remote_write)
-    # TODO: add alerts from remote write
-    # https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/37277
     # TODO: Luca: probably don't need this anymore
     remote_write.reload_alerts()
-    return remote_write.endpoints
+    return sorted(remote_write.endpoints, key=lambda endpoint: endpoint["url"])
 
 
-def _get_tracing_receiver_url(protocol: ReceiverProtocol, tls_enabled: bool) -> str:
+def _get_tracing_receiver_url(
+    protocol: ReceiverProtocol, tls_enabled: bool, ports: Optional[Dict[str, int]] = None
+) -> str:
     """Build the endpoint URL for a tracing receiver.
 
     Args:
         protocol: The tracing protocol to build the URL for.
         tls_enabled: Whether to use HTTPS (True) or HTTP (False) for the URL.
-
+        ports: port map produced by build_port_map(); if None the enum defaults are used.
 
     Returns:
         str: The complete URL for the tracing receiver endpoint.
@@ -253,6 +267,8 @@ def _get_tracing_receiver_url(protocol: ReceiverProtocol, tls_enabled: bool) -> 
         The method assumes the receiver is in the same model since the charm
         doesn't have ingress support. The FQDN is used as the hostname.
     """
+    if ports is None:
+        ports = build_port_map()
     scheme = "http"
     if tls_enabled:
         scheme = "https"
@@ -260,25 +276,33 @@ def _get_tracing_receiver_url(protocol: ReceiverProtocol, tls_enabled: bool) -> 
     # The correct transport protocol is specified in the tracing library, and it's always
     # either http or grpc.
     if receiver_protocol_to_transport_protocol[protocol] == TransportProtocolType.grpc:
-        return f"{socket.getfqdn()}:{Port.otlp_grpc.value}"
-    return f"{scheme}://{socket.getfqdn()}:{Port.otlp_http.value}"
+        return f"{socket.getfqdn()}:{ports[Port.otlp_grpc.name]}"
+    return f"{scheme}://{socket.getfqdn()}:{ports[Port.otlp_http.name]}"
 
 
-def receive_traces(charm: CharmBase, tls: bool) -> Set:
+def receive_traces(
+    charm: CharmBase, tls: bool, ports: Optional[Dict[str, int]] = None
+) -> List[ReceiverProtocol]:
     """Integrate with other charms via the receive-traces relation endpoint.
 
     Returns:
         All receiver protocols that have been requested.
     """
+    if ports is None:
+        ports = build_port_map()
     tracing_provider = TracingEndpointProvider(charm, relation_name="receive-traces")
     charm.__setattr__("tracing_provider", tracing_provider)
     # Enable traces ingestion with TracingEndpointProvider, i.e. configure the receivers
-    requested_tracing_protocols = set(tracing_provider.requested_protocols()).union(
-        {
-            receiver
-            for receiver in get_args(ReceiverProtocol)
-            if charm.config.get(f"always_enable_{receiver}")
-        }
+    # Sort for deterministic iteration order: this sequence is published to the relation
+    # databag and consumed to build the collector config file.
+    requested_tracing_protocols = sorted(
+        set(tracing_provider.requested_protocols()).union(
+            {
+                receiver
+                for receiver in get_args(ReceiverProtocol)
+                if charm.config.get(f"always_enable_{receiver}")
+            }
+        )
     )
     # Send tracing receivers over relation data to charms sending traces to otel collector
     # TODO: leader-only because of
@@ -291,6 +315,7 @@ def receive_traces(charm: CharmBase, tls: bool) -> Set:
                     _get_tracing_receiver_url(
                         protocol=protocol,
                         tls_enabled=tls,
+                        ports=ports,
                     ),
                 )
                 for protocol in requested_tracing_protocols
@@ -299,14 +324,16 @@ def receive_traces(charm: CharmBase, tls: bool) -> Set:
     return requested_tracing_protocols
 
 
-def receive_profiles(charm: CharmBase, tls: bool) -> None:
+def receive_profiles(charm: CharmBase, tls: bool, ports: Optional[Dict[str, int]] = None) -> None:
     """Integrate with other charms over the receive-profiles relation endpoint."""
     if not charm.unit.is_leader():
         # TODO: leader-only because of
         #  https://github.com/canonical/opentelemetry-collector-operator/issues/71
         return
+    if ports is None:
+        ports = build_port_map()
     fqdn = socket.getfqdn()
-    grpc_endpoint = f"{fqdn}:{Port.otlp_grpc.value}"
+    grpc_endpoint = f"{fqdn}:{ports[Port.otlp_grpc.name]}"
     # this charm lib exposes a holistic API, so we don't need to bind the instance
     ProfilingEndpointProvider(
         charm.model.relations["receive-profiles"], app=charm.app
@@ -325,11 +352,12 @@ def send_profiles(charm: CharmBase) -> List[ProfilingEndpoint]:
     ]
 
 
-def send_traces(charm: CharmBase) -> Optional[str]:
+def send_traces(charm: CharmBase) -> Dict[int, str]:
     """Integrate with Tempo via the send-traces relation endpoint.
 
     Returns:
-        The tracing OTLP HTTP endpoint if the Provider is ready, None otherwise
+        A mapping of relation ID to OTLP HTTP endpoint for every ready
+        ``send-traces`` relation. Returns an empty dict when no relation is ready.
     """
     # Enable pushing traces to a backend (i.e. Tempo) with TracingEndpointRequirer, i.e. configure the exporters
     tracing_requirer = TracingEndpointRequirer(
@@ -343,9 +371,12 @@ def send_traces(charm: CharmBase) -> Optional[str]:
     # NOTE: the name must be 'tracing' because the COS Agent library hardcodes it
     # https://github.com/canonical/grafana-agent-operator/blob/7363627f4e83b03ef179506a95b5fb411523b041/lib/charms/grafana_agent/v0/cos_agent.py#L1062
     charm.__setattr__("tracing", tracing_requirer)
-    if not tracing_requirer.is_ready():
-        return None
-    return tracing_requirer.get_endpoint("otlp_http")
+    return {
+        rel.id: endpoint
+        for rel in charm.model.relations["send-traces"]
+        if tracing_requirer.is_ready(rel)
+        if (endpoint := tracing_requirer.get_endpoint("otlp_http", rel)) is not None
+    }
 
 
 def send_charm_traces(charm: CharmBase) -> Optional[str]:
@@ -384,7 +415,7 @@ def _get_dashboards(relations: List[Relation]) -> List[Dict[str, Any]]:
     return list(aggregate.values())
 
 
-def _add_dashboards(dashboards: List[Dict[str, str]], dest_path: Path):
+def _add_dashboards(dashboards: List[Dict[str, Any]], dest_path: Path):
     """Save the dashboards to files in the specified destination folder.
 
     For K8s charms, dashboards are saved in the charm container.
@@ -401,13 +432,22 @@ def _add_dashboards(dashboards: List[Dict[str, str]], dest_path: Path):
     """
     dest_path.mkdir(parents=True, exist_ok=True)
     for dash in dashboards:
-        # Build dashboard custom filename
+        # Build dashboard custom filename.
+        # The (title, charm, rel_id) triple is not guaranteed to be unique: multiple
+        # untitled dashboards, or dashboards sharing a title, from the same principal
+        # would otherwise collide on the same filename and silently overwrite each other
+        # (see https://github.com/canonical/cos-proxy-operator/pull/241). To make the
+        # filename collision-proof regardless of the title, we append a stable content
+        # identity: the dashboard `uid` if present, else a short hash of the content.
+        content = dash["content"]
         charm_name = dash.get("charm", "charm-name")
         rel_id = dash.get("relation_id", "rel_id")
         title = dash.get("title", "").replace(" ", "_").replace("/", "_").lower()
-        filename = f"juju_{title}-{charm_name}-{rel_id}.json"
+        uid = content.get("uid") or content.get("dashboard", {}).get("uid")
+        identity = uid or sha256(json.dumps(content, sort_keys=True))[:8]
+        filename = f"juju_{title}-{charm_name}-{rel_id}-{identity}.json"
         with open(Path(dest_path, filename), mode="w", encoding="utf-8") as f:
-            f.write(json.dumps(dash["content"]))
+            f.write(json.dumps(content))
             logger.debug("updated dashboard file %s", f.name)
 
 
@@ -442,6 +482,47 @@ def forward_dashboards(charm: CharmBase):
     # TODO: Do we need to implement dashboard status changed logic?
     #   This propagates Grafana's errors to the charm which provided the dashboard
     # grafana_dashboards_provider._reinitialize_dashboard_data(inject_dropdowns=False)
+
+
+def send_otlp(charm: CharmBase) -> Dict[int, OtlpEndpoint]:
+    """Instantiate the OtlpRequirer.
+
+    This provides otelcol with the remote's OTLP endpoint for each relation.
+
+    The rule files staged in the *_RULES_DEST_PATH directories are published to the databag.
+    These directories contain both the charm's own bundled rules (copied from src/*_rules) and,
+    conditional to the `forward_alert_rules` config, the alert rules gathered from related
+    applications. The DEST directories are populated, in order, by:
+      * `scrape_metrics`        -> metrics-endpoint alerts  (METRICS_RULES_DEST_PATH)
+      * `receive_loki_logs`     -> receive-loki-logs alerts (LOKI_RULES_DEST_PATH)
+      * the cos-agent handling in `charm.reconcile` (leader-only) -> cos-agent metrics/logs alerts
+
+    NOTE: This function MUST be called after all of the above have run, so that the DEST
+    directories are fully populated before being forwarded. Otherwise alert rules from related
+    applications (e.g. postgresql) would be silently dropped from the OTLP databag.
+    See https://github.com/canonical/opentelemetry-collector-operator/issues/297
+    """
+    # Gather all staged rules: bundled rules plus the alerts forwarded by related applications.
+    charm_root = charm.charm_dir.absolute()
+    rules = (
+        RuleStore(JujuTopology.from_charm(charm))
+        .add_logql_path(charm_root.joinpath(LOKI_RULES_DEST_PATH), recursive=True)
+        .add_promql_path(charm_root.joinpath(METRICS_RULES_DEST_PATH), recursive=True)
+    )
+    # Publish rules for the provider
+    extra_alert_labels = cast(str, charm.model.config.get("extra_alert_labels", ""))
+    OtlpRequirer(
+        charm,
+        # NOTE: we set aggregator_peer_relation_name to ensure aggregator generic rules are published
+        aggregator_peer_relation_name="peers",
+        rules=rules,
+        extra_alert_labels=key_value_pair_string_to_dict(extra_alert_labels),
+    ).publish()
+
+    # Access the provider's endpoints
+    return OtlpRequirer(
+        charm, protocols=["grpc", "http"], telemetries=["logs", "metrics", "traces"]
+    ).endpoints
 
 
 # TODO: Luca: move this into the GrafanCloudIntegrator library

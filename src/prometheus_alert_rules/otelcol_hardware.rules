@@ -5,7 +5,7 @@ groups:
         expr: max(rate(otelcol_process_cpu_seconds_total{}[5m])*100) > 90
         for: 5m
         labels:
-          severity: critical
+          severity: warning
         annotations:
-          summary: High max CPU usage
-          description: Collector needs to scale up
+          summary: High max CPU usage (unit {{ $labels.juju_unit }} in model {{ $labels.juju_model }})
+          description: Collector needs to scale up (unit {{ $labels.juju_unit }} in model {{ $labels.juju_model }})

@@ -10,12 +10,14 @@ import shutil
 import socket
 import subprocess
 from pathlib import Path
+
 from typing import Any, Dict, List, Mapping, Optional, cast
 
 import ops
 from charmlibs.pathops import LocalPath
 from charms.grafana_agent.v0.cos_agent import COSAgentRequirer
-from charms.operator_libs_linux.v1.systemd import service_start
+from charms.loki_k8s.v1.loki_push_api import LokiPushApiProvider
+from charms.prometheus_k8s.v0.prometheus_scrape import MetricsEndpointConsumer
 from charms.operator_libs_linux.v2 import snap  # type: ignore
 from cosl import JujuTopology, MandatoryRelationPairs
 from ops import BlockedStatus, CharmBase, RelationChangedEvent
@@ -23,24 +25,25 @@ from ops.model import ActiveStatus, MaintenanceStatus, WaitingStatus
 from tenacity import retry, stop_after_attempt, wait_fixed
 
 import integrations
-from config_builder import Component
+from config_builder import Component, Port, build_port_map
 from config_manager import ConfigManager
+from utils import hash_ca_cert_dir
 from constants import (
     CERT_DIR,
     CONFIG_FOLDER,
     DASHBOARDS_DEST_PATH,
-    LOGROTATE_PATH,
-    LOGROTATE_SRC_PATH,
+    EXTERNAL_CONFIG_SECRETS_DIR,
     LOKI_RULES_DEST_PATH,
     METRICS_RULES_DEST_PATH,
     NODE_EXPORTER_DISABLED_COLLECTORS,
     NODE_EXPORTER_ENABLED_COLLECTORS,
+    NODE_EXPORTER_TEXTFILE_DIRECTORY,
     RECV_CA_CERT_FOLDER_PATH,
     SERVER_CA_CERT_PATH,
     SERVER_CERT_PATH,
     SERVER_CERT_PRIVATE_KEY_PATH,
 )
-from singleton_snap import SingletonSnapManager, SnapRegistrationFile
+from singleton_snap import SingletonSnapManager, normalize_unit_name
 from snap_fstab import SnapFstab
 from snap_management import (
     SnapMap,
@@ -110,15 +113,6 @@ def refresh_certs():
     subprocess.run(["update-ca-certificates", "--fresh"], check=True)
 
 
-def ensure_logrotate_timer():
-    """Run systemctl start logrotate.timer --now to enable and start the service.
-
-    Raises:
-        SystemdError: if logrotate.timer cannot be enabled or started.
-    """
-    service_start("logrotate.timer", "--now")
-
-
 def event() -> str:
     """Return Juju hook|action name.
 
@@ -127,6 +121,7 @@ def event() -> str:
     - https://github.com/juju/juju/blob/cbb05654c7444dd6bee29e49aff16339f02c34f9/docs/reference/hook.md?plain=1#L1088
     """
     return os.environ.get("JUJU_HOOK_NAME") or os.environ.get("JUJU_ACTION_NAME", "")
+
 
 def _get_missing_mandatory_relations(charm: CharmBase) -> Optional[str]:
     """Check whether mandatory relations are in place.
@@ -145,12 +140,14 @@ def _get_missing_mandatory_relations(charm: CharmBase) -> Optional[str]:
                 {"cloud-config"},  # or
                 {"send-remote-write"},  # or
                 {"send-loki-logs"},  # or
-                {"grafana-dashboards-provider"},
+                {"grafana-dashboards-provider"},  # or
+                {"send-otlp"},  # or
             ],
             "juju-info": [  # must be paired with:
                 {"cloud-config"},  # or
                 {"send-remote-write"},  # or
-                {"send-loki-logs"},
+                {"send-loki-logs"},  # or
+                {"send-otlp"},  # or
             ],
         }
     )
@@ -162,9 +159,14 @@ def _get_missing_mandatory_relations(charm: CharmBase) -> Optional[str]:
 class OpenTelemetryCollectorCharm(ops.CharmBase):
     """Charm the service."""
 
+    loki_provider: LokiPushApiProvider
+    metrics_consumer: MetricsEndpointConsumer
+
     def __init__(self, framework: ops.Framework):
         super().__init__(framework)
-        if event() in ("install", "upgrade"):
+        self.external_configs: List[Dict[str, Any]] = []
+        self.external_secret_files: Dict[str, str] = {}
+        if event() in ("install", "upgrade-charm"):
             self._install_snaps()
         elif event() == "remove":
             # NOTE: We need to clean up the config file and uninstall the snap(s). If we do this
@@ -179,16 +181,25 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         self._reconcile()
 
     def _reconcile(self):
+        # Re-assert this unit's snap registrations. These lockfiles are reference counts, read
+        # on removal to decide whether the last unit standing may uninstall a shared snap, so
+        # they belong to the desired state. Registering only on install/upgrade-charm left a
+        # lockfile that was deleted out of band missing until the next `juju refresh`.
+        # Refs https://github.com/canonical/opentelemetry-collector-operator/issues/208
+        self._register_snaps()
+
         insecure_skip_verify = cast(bool, self.config.get("tls_insecure_skip_verify"))
-        topology = JujuTopology.from_charm(self)
         # NOTE: Only the leader aggregates alerts, to prevent duplication. COS Agent alerts
         # come from peer data, so the leader can access all of them, regardless where multiple
         # principals are located.
         if self.unit.is_leader():
-            integrations.cleanup()
+            integrations.cleanup(self.charm_dir.absolute())
 
-        # Integrate with TLS relations
-        receive_ca_certs_hash = integrations.receive_ca_cert(
+        # Integrate with TLS relations.
+        # NOTE: receive_ca_cert writes the CA files under RECV_CA_CERT_FOLDER_PATH; its
+        # returned hash is intentionally not used as a restart trigger (see the
+        # hash_ca_cert_dir call below, which hashes the materialized files instead).
+        integrations.receive_ca_cert(
             self,
             recv_ca_cert_folder_path=LocalPath(RECV_CA_CERT_FOLDER_PATH),
         )
@@ -206,8 +217,8 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
 
         if current_event in (
             "upgrade-charm",
-            "receive_ca_cert-relation-changed",
-            "receive_server_cert-relation-changed",
+            "receive-ca-cert-relation-changed",
+            "receive-server-cert-relation-changed",
             "reconcile",
         ):
             refresh_certs()
@@ -226,7 +237,22 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 )
                 return
 
+        # Parse port overrides from Juju config
+        try:
+            port_map = build_port_map(cast(str, self.config.get("ports")))
+        except ValueError as e:
+            self.unit.status = BlockedStatus(f"Invalid ports config: {e}")
+            return
+
         # Create the config manager
+        topology = JujuTopology.from_charm(self)
+        topology_labels = {
+            "juju_charm": topology.charm_name,
+            "juju_model": topology.model,
+            "juju_model_uuid": topology.model_uuid,
+            "juju_application": topology.application,
+            "juju_unit": topology.unit,
+        }
         config_manager = ConfigManager(
             unit_name=self.unit.name,
             hostname=socket.gethostname(),
@@ -236,13 +262,13 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             insecure_skip_verify=cast(bool, self.config.get("tls_insecure_skip_verify")),
             queue_size=cast(int, self.config.get("queue_size")),
             max_elapsed_time_min=cast(int, self.config.get("max_elapsed_time_min")),
+            ports=port_map,
+            internal_host=socket.getfqdn(),
+            topology_labels=topology_labels,
         )
 
-        # Self-mon logging
-        self._configure_logrotate()
-
         # Tracing setup
-        requested_tracing_protocols = integrations.receive_traces(self, tls=is_tls_ready())
+        requested_tracing_protocols = integrations.receive_traces(self, tls=is_tls_ready(), ports=port_map)
         config_manager.add_traces_ingestion(requested_tracing_protocols)
         # Add default processors to traces
         config_manager.add_traces_processing(
@@ -250,8 +276,10 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             sampling_rate_workload=cast(float, self.config.get("tracing_sampling_rate_workload")),
             sampling_rate_error=cast(float, self.config.get("tracing_sampling_rate_error")),
         )
-        if tracing_otlp_http_endpoint := integrations.send_traces(self):
-            config_manager.add_traces_forwarding(tracing_otlp_http_endpoint)
+        tracing_endpoints = integrations.send_traces(self)
+        for rel_id, endpoint in sorted(tracing_endpoints.items()):
+            config_manager.add_traces_forwarding(endpoint, identifier=rel_id)
+        if tracing_endpoints:
             integrations.send_charm_traces(self)
 
         # COS Agent setup
@@ -289,7 +317,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                             "static_configs": [
                                 {
                                     "targets": [
-                                        "0.0.0.0:9100"  # TODO: extract this node-exporter port somewhere
+                                        f"0.0.0.0:{port_map[Port.node_exporter.name]}"
                                     ],
                                     "labels": {
                                         "instance": socket.getfqdn(),
@@ -340,6 +368,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         otelcol_fstab = SnapFstab(
             LocalPath("/var/lib/snapd/mount/snap.opentelemetry-collector.fstab")
         )
+        path_exclusions = cast(str, self.config.get("path_exclude")).split(";")
         for fstab_entry in otelcol_fstab.entries:
             if fstab_entry.owner not in endpoint_owners.keys():
                 continue
@@ -353,7 +382,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                         if fstab_entry
                         else "/snap/opentelemetry-collector/current/shared-logs/**"
                     ],
-                    exclude=[],
+                    exclude=path_exclusions,
                     attributes={
                         "job": f"{fstab_entry.owner}-{fstab_entry.relative_target}",
                         "juju_application": endpoint_owners[fstab_entry.owner]["juju_application"],
@@ -362,6 +391,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                         "juju_model": topology.model,
                         "juju_model_uuid": topology.model_uuid,
                         "snap_name": fstab_entry.owner,
+                        "instance": socket.getfqdn(),
                     },
                 ),
                 pipelines=[f"logs/{self.unit.name}"],
@@ -389,14 +419,13 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 pipelines=[f"logs/{self.unit.name}"],
             )
         ### Add /var/log scrape job
-        var_log_exclusions = cast(str, self.config.get("path_exclude")).split(";")
         # NOTE: var-log is an expensive receiver, avoid duplicating it with a unit identifier
         config_manager.config.add_component(
             Component.receiver,
             "filelog/var-log",
             _filelog_receiver_config(
                 include=["/var/log/**/*log"],
-                exclude=var_log_exclusions,
+                exclude=path_exclusions,
                 attributes={
                     "job": "opentelemetry-collector-var-log",
                     "juju_application": topology.application,
@@ -417,6 +446,12 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 dest_path=self.charm_dir.absolute().joinpath(LOKI_RULES_DEST_PATH),
             )
 
+
+        # External-config setup
+        self.external_configs, self.external_secret_files = integrations.receive_external_configs(self)
+        self._write_secrets_to_disk(self.external_secret_files)
+        self._configure_external_configs(config_manager)
+
         # Profiling setup
         # cfr. https://github.com/open-telemetry/opentelemetry-collector/tree/main/featuregate
         feature_gates = None
@@ -427,7 +462,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         #  making the right choice in this tradeoff.
         if self._has_incoming_profiles:
             config_manager.add_profile_ingestion()
-            integrations.receive_profiles(self, tls=is_tls_ready())
+            integrations.receive_profiles(self, tls=is_tls_ready(), ports=port_map)
         if profiling_endpoints := integrations.send_profiles(self):
             config_manager.add_profile_forwarding(
                 profiling_endpoints,
@@ -436,7 +471,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             feature_gates = "service.profilesSupport"
 
         # Logs setup
-        integrations.receive_loki_logs(self, tls=is_tls_ready())
+        integrations.receive_loki_logs(self, tls=is_tls_ready(), ports=port_map)
         loki_endpoints = integrations.send_loki_logs(self)
         if self._has_incoming_logs_relation:
             config_manager.add_log_ingestion()
@@ -447,18 +482,14 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             identifier=topology.identifier,
             labels={
                 "instance": f"{topology.identifier}_{topology.unit}",
-                "juju_charm": topology.charm_name,
-                "juju_model": topology.model,
-                "juju_model_uuid": topology.model_uuid,
-                "juju_application": topology.application,
-                "juju_unit": topology.unit,
+                **topology_labels,
             },
         )
         # For now, the only incoming and outgoing metrics relations are remote-write/scrape
         metrics_consumer_jobs = integrations.scrape_metrics(self)
         # Write CA certificates to disk and update job configurations
         try:
-            self._ensure_certs_dir()
+            self._ensure_directory(CERT_DIR)
             cert_paths = self._write_ca_certificates_to_disk(metrics_consumer_jobs)
             metrics_consumer_jobs = config_manager.update_jobs_with_ca_paths(
                 metrics_consumer_jobs, cert_paths
@@ -473,6 +504,14 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             # This is conditional because otherwise remote_write.endpoints causes error on relation-broken
             remote_write_endpoints = integrations.send_remote_write(self)
             config_manager.add_remote_write(remote_write_endpoints)
+
+        # OTLP setup
+        # NOTE: this must run after the logs/metrics/cos-agent integrations above so that the
+        # *_RULES_DEST_PATH directories contain the alert rules gathered from related applications
+        # (e.g. postgresql). Otherwise those rules would be dropped from the OTLP databag.
+        # See https://github.com/canonical/opentelemetry-collector-operator/issues/297
+        otlp_endpoints = integrations.send_otlp(self)
+        config_manager.add_otlp_forwarding(otlp_endpoints)
 
         # Dashboards setup
         ## COS Agent dashboards
@@ -503,20 +542,32 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         if custom_processors := cast(str, self.config.get("processors")):
             config_manager.add_custom_processors(custom_processors)
 
-        # Push the config and Push the config and deploy/update
-        config_filename = f"{SnapRegistrationFile._normalize_name(self.unit.name)}.yaml"
+        # Memory limiter setup
+        valid_mem_limit = self._configure_limits_processor(config_manager)
+
+        # Push the config and deploy/update
+        config_filename = f"{normalize_unit_name(self.unit.name)}.yaml"
         config_path = LocalPath(os.path.join(CONFIG_FOLDER, config_filename))
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(config_manager.config.build())
 
         # If the config file or any cert has changed, a change in the hash
-        # will trigger a restart
-        hash_file = self.charm_dir.absolute()/"config_hash"
+        # will trigger a restart.
+        # NOTE: The CA component is hashed from the files materialized on disk under
+        # RECV_CA_CERT_FOLDER_PATH (after refresh_certs ran update-ca-certificates),
+        # not from the relation data. This keeps the restart aligned with the bytes
+        # the snap will actually load, so a newly trusted CA always forces a restart
+        # even when the certificate_transfer handshake spans multiple hooks.
+        hash_file = self.charm_dir.absolute() / "config_hash"
         old_hash = ""
         if hash_file.exists():
             old_hash = hash_file.read_text()
         current_hash = ",".join(
-            [config_manager.config.hash, receive_ca_certs_hash, server_cert_hash]
+            [
+                config_manager.config.hash,
+                hash_ca_cert_dir(RECV_CA_CERT_FOLDER_PATH),
+                server_cert_hash,
+            ]
         )
         if current_hash != old_hash:
             for snap_name in SnapMap.snaps():
@@ -552,12 +603,30 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
                 self.unit.status = BlockedStatus(f"Mismatching snap revisions for {snap_name}")
                 return
 
-        self._configure_node_exporter_collectors()
+        self._ensure_directory(NODE_EXPORTER_TEXTFILE_DIRECTORY)
+        self._configure_node_exporter(port_map[Port.node_exporter.name])
         self.unit.status = ActiveStatus()
+
+        if not valid_mem_limit:
+            self.unit.status = BlockedStatus(
+                "Invalid memory_limit_percentage config value: defaulting to 100, see debug-log"
+            )
 
         # Mandatory relation pairs
         if missing_relations := _get_missing_mandatory_relations(self):
             self.unit.status = BlockedStatus(missing_relations)
+
+        # Invalid alert rules
+        if self._has_invalid_prometheus_alerts():
+            self.unit.status = BlockedStatus("Invalid Prometheus alerts. See debug-log")
+
+        # Invalid loki alert rules
+        if self._has_invalid_loki_alerts():
+            self.unit.status = BlockedStatus("Invalid Loki alerts. See debug-log")
+
+        # Invalid scrape jobs
+        if self._has_invalid_scrape_job():
+            self.unit.status = BlockedStatus("Invalid scrape jobs. See debug-log")
 
         # Workload version
         self.unit.set_workload_version(self._otelcol_version or "")
@@ -578,13 +647,24 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
             return result
         return result.group(1)
 
-    def _install_snaps(self) -> None:
+    def _register_snaps(self) -> None:
+        """Reference-count this unit against every managed snap.
+
+        Registering is idempotent and cheap (one empty file per snap), which is what makes it
+        safe to call on every reconcile. Installing is neither, so it stays in `_install_snaps`.
+        """
         manager = SingletonSnapManager(self.unit.name)
+        for snap_name in SnapMap.snaps():
+            manager.register(snap_name, SnapMap.get_revision(snap_name))
+
+    def _install_snaps(self) -> None:
+        # Register before installing, so a snap that only partially installs, or whose service
+        # fails to start, is still reference counted for this unit.
+        self._register_snaps()
 
         for snap_name in SnapMap.snaps():
             snap_revision = SnapMap.get_revision(snap_name)
-            manager.register(snap_name, snap_revision)
-            revisions = manager.get_revisions(snap_name)
+            revisions = SingletonSnapManager.get_revisions(snap_name)
             if snap_revision >= (max(revisions) if revisions else 0):
                 # Install the snap
                 self.unit.status = MaintenanceStatus(f"Installing {snap_name} snap")
@@ -611,19 +691,32 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         """Coordinate node-exporter snap removal."""
         manager = SingletonSnapManager(self.unit.name)
         snap_name = "node-exporter"
-        snap_revision = SnapMap.get_revision(snap_name)
-        manager.unregister(snap_name, snap_revision)
+        manager.unregister_all_for_unit(snap_name)
         if not manager.is_used_by_other_units(snap_name):
             self._remove_snap(snap_name)
+
+        self._remove_node_exporter_info_metric_file()
+
+    def _remove_node_exporter_info_metric_file(self):
+        """Remove the node-exporter info metrics file."""
+        path = self._node_exporter_info_metric_file_path
+        try:
+            existed = path.exists()
+            path.unlink(missing_ok=True)
+            if existed:
+                logger.debug(f"removed node-exporter info metric file: {path}")
+        except OSError as e:
+            # Emit warning and suppress error
+            logger.warning(f"failed to remove node-exporter info metric file {path}: {e}")
+
 
     def _remove_opentelemetry_collector(self):
         """Coordinate opentelemetry-collector snap and config file removal."""
         manager = SingletonSnapManager(self.unit.name)
         snap_name = "opentelemetry-collector"
-        snap_revision = SnapMap.get_revision(snap_name)
-        manager.unregister(snap_name, snap_revision)
+        manager.unregister_all_for_unit(snap_name)
         if manager.is_used_by_other_units(snap_name):
-            config_filename = f"{SnapRegistrationFile._normalize_name(self.unit.name)}.yaml"
+            config_filename = f"{normalize_unit_name(self.unit.name)}.yaml"
             config_path = LocalPath(os.path.join(CONFIG_FOLDER, config_filename))
             try:
                 config_path.unlink()
@@ -646,37 +739,16 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         # TODO: Luca if the snap is used by other units, we should probably `ensure`
         # that the max_revision is installed instead.
 
-    def _configure_node_exporter_collectors(self):
-        """Configure the node-exporter snap collectors."""
+    def _configure_node_exporter(self, port: int):
+        """Configure the node-exporter snap."""
         configs = {
-            "collectors": " ".join(list(NODE_EXPORTER_ENABLED_COLLECTORS)),
-            "no-collectors": " ".join(list(NODE_EXPORTER_DISABLED_COLLECTORS)),
+            "collectors": " ".join(sorted(NODE_EXPORTER_ENABLED_COLLECTORS)),
+            "no-collectors": " ".join(sorted(NODE_EXPORTER_DISABLED_COLLECTORS)),
+            "web.listen-address": f":{port}",
         }
         ne_snap = self.snap("node-exporter")
         self._set_snap_configs_with_retry(ne_snap, configs)
-
-    def _configure_logrotate(self):
-        """Configure logrotate for otelcol's internal logs.
-
-        When we set `output_paths` in the internal logging config:
-        https://opentelemetry.io/docs/collector/internal-telemetry/#configure-internal-logs
-
-        a custom logrotate configuration is needed to rotate the logs written to disk.
-        FIXME: https://github.com/canonical/opentelemetry-collector-operator/issues/139
-
-        Raises:
-            SystemdError: if logrotate.timer cannot be enabled or started.
-        """
-        ensure_logrotate_timer()
-
-        config_path = LocalPath(LOGROTATE_PATH)
-        if config_path.exists():
-            return
-
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        charm_root = self.charm_dir.absolute()
-        with open(charm_root.joinpath(*LOGROTATE_SRC_PATH.split("/")), "r") as f:
-            config_path.write_text(f.read())
+        self._node_exporter_info_metric_file_path.write_text(self._info_metric)
 
     # We use tenacity because .set() performs a HTTP request to the snapd server which is not always ready
     @retry(stop=stop_after_attempt(5), wait=wait_fixed(5))
@@ -697,10 +769,20 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         """
         return snap.SnapCache()[snap_name]
 
-    def _ensure_certs_dir(self) -> None:
-        cert_dir = Path(CERT_DIR)
-        cert_dir.mkdir(parents=True, exist_ok=True)
-        cert_dir.chmod(0o755)
+    def _ensure_directory(self, path: str) -> None:
+        directory = LocalPath(path)
+        directory.mkdir(parents=True, exist_ok=True)
+        directory.chmod(0o755)
+
+    def _remove_external_configs_secrets_dir(self) -> None:
+        directory = LocalPath(EXTERNAL_CONFIG_SECRETS_DIR)
+        if not directory.exists():
+            return
+
+        try:
+            shutil.rmtree(directory)
+        except OSError as e:
+            logger.warning("failed to remove external config secrets dir %s: %s", directory, e)
 
     def _write_ca_certificates_to_disk(self, scrape_jobs: List[Dict]) -> Dict[str, str]:
         """Write CA certificates from jobs to a dedicated directory and return mapping of job names to file paths.
@@ -746,6 +828,40 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
 
         return cert_paths
 
+    def _write_secrets_to_disk(self, external_secret_files: dict[str, str]) -> None:
+        if not external_secret_files:
+            self._remove_external_configs_secrets_dir()
+            return
+        self._ensure_directory(EXTERNAL_CONFIG_SECRETS_DIR)
+        for filepath, secret in external_secret_files.items():
+            filepath = LocalPath(filepath)
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(secret, mode=0o644)
+            logger.debug("secret written to %s", filepath)
+
+    def _configure_external_configs(self, config_manager: ConfigManager):
+        config_manager.add_external_configs(self.external_configs)
+
+    def _clamp_memory_limit(self, config_value: int) -> int:
+        """Default the memory limit percentage to 100 if input is not in [0, 100]."""
+        if config_value < 0 or config_value > 100:
+            logger.warning(
+                "Invalid memory_limit_percentage charm config option, must be in the range [0, 100]."
+            )
+            return 100
+        return config_value
+
+    def _configure_limits_processor(self, config_manager: ConfigManager) -> bool:
+        """Configure the memory limiter processor.
+
+        Returns:
+            True if the config value was valid, False otherwise.
+        """
+        raw_limit = cast(int, self.config.get("memory_limit_percentage"))
+        limit = self._clamp_memory_limit(raw_limit)
+        config_manager.add_memory_limiter_processor(limit)
+        return raw_limit == limit
+
     def _cleanup_certificates_on_remove(self):
         """Clean up certificates during charm removal.
 
@@ -778,6 +894,7 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
         except OSError as e:
             logger.warning(f"Failed to remove parent certificate directory: {e}")
 
+    @property
     def _has_incoming_logs_relation(self) -> bool:
         return any(self.model.relations.get("receive-loki-logs", []))
 
@@ -796,6 +913,57 @@ class OpenTelemetryCollectorCharm(ops.CharmBase):
     @property
     def _has_server_cert_relation(self) -> bool:
         return any(self.model.relations.get("receive-server-cert", []))
+
+    def _has_invalid_loki_alerts(self) -> bool:
+        """Check if any receive-loki-logs relation reported invalid alert rules."""
+        return self.loki_provider.has_invalid_alert_rules()
+
+    def _has_invalid_prometheus_alerts(self) -> bool:
+        """Check if any metrics-endpoint relation reported invalid alert rules."""
+        return self.metrics_consumer.has_invalid_alert_rules()
+
+    def _has_invalid_scrape_job(self) -> bool:
+        """Check if any metrics-endpoint relation reported invalid scrape jobs."""
+        return self.metrics_consumer.has_invalid_scrape_jobs()
+
+    @property
+    def _node_exporter_info_metric_file_path(self) -> LocalPath:
+        """Avoid duplicating node exporter metrics per principal unit.
+
+        Accomplished by enabling the textfile collector and "scraping" metrics from a text file generated by this charm for every cos_agent relation.
+        """
+        return LocalPath(NODE_EXPORTER_TEXTFILE_DIRECTORY) / f"{self.unit.name.replace('/','_')}.prom"
+
+    @property
+    def _related_unit_pairs(self) -> list[tuple[str, str]]:
+        """Return (unit_name, app_name) for all units related via cos-agent or juju-info.
+
+        Returns an empty list if no units are currently related (e.g. during relation-departed
+        before the subordinate unit is removed).
+        """
+        return sorted(
+            {
+                (unit.name, unit.app.name)
+                for rel_name in ("cos-agent", "juju-info")
+                for rel in self.model.relations.get(rel_name, [])
+                for unit in rel.units
+            }
+        )
+
+    @property
+    def _info_metric(self) -> str:
+        otelcol_unit = self.unit.name
+        otelcol_app = self.app.name
+
+        lines = [
+            "# HELP otelcol_subordinate_charm_info Subordinate charm information",
+            "# TYPE otelcol_subordinate_charm_info gauge",
+        ]
+        for related_unit, related_app in self._related_unit_pairs:
+            lines.append(
+                f'otelcol_subordinate_charm_info{{otelcol_app="{otelcol_app}", otelcol_unit="{otelcol_unit}", related_app="{related_app}", related_unit="{related_unit}"}} 1'
+            )
+        return "\n".join(lines) + "\n"
 
 
 if __name__ == "__main__":  # pragma: nocover

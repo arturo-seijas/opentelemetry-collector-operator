@@ -7,22 +7,17 @@ variable "app_name" {
 variable "channel" {
   description = "Channel that the charm is deployed from"
   type        = string
+
+  validation {
+    condition     = startswith(var.channel, "dev/")
+    error_message = "The track of the channel must be 'dev/'. e.g. 'dev/edge'."
+  }
 }
 
 variable "config" {
   description = "Map of the charm configuration options"
   type        = map(string)
   default     = {}
-}
-
-# We use constraints to set AntiAffinity in K8s
-# https://discourse.charmhub.io/t/pod-priority-and-affinity-in-juju-charms/4091/13
-variable "constraints" {
-  description = "String listing constraints for this application"
-  type        = string
-  # FIXME: Passing an empty constraints value to the Juju Terraform provider currently
-  # causes the operation to fail due to https://github.com/juju/terraform-provider-juju/issues/344
-  default = "arch=amd64"
 }
 
 variable "model_uuid" {
